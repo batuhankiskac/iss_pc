@@ -36,6 +36,10 @@ void runtime_set_thread_start_hook(void (*hook)(void));
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
 void runtime_mutex_report(void);
+/* Adds the calling thread's lock/unlock/wait/wakeup counts to the report totals (thread exit). */
+void runtime_mutex_flush_counts(void);
+/* Report totals so far: locks, unlocks, waits, wakeups (tests). */
+void runtime_mutex_counts(size_t out[4]);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);

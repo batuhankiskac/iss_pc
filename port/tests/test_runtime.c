@@ -140,6 +140,32 @@ static void mutexes(void) {
     assert((uint32_t)trylock(&mutex)==0x80020010);
     assert(unlock(&mutex)==0 && destroy(&mutex)==0);
 }
+/* Per-thread lock counts reach the report totals: in batches, at flush, none lost or doubled. */
+enum { COUNT_THREADS = 4, COUNT_PAIRS = 1000 }; /* 1000 is not a multiple of the batch size */
+static void *count_locks(void *mutex) {
+    HandleOp lock=GET(HandleOp,"9UK1vLZQft4#libkernel"), unlock=GET(HandleOp,"tn3VlD0hG60#libkernel");
+    for (int i=0;i<COUNT_PAIRS;++i) { assert(lock(mutex)==0); assert(unlock(mutex)==0); }
+    runtime_mutex_flush_counts();
+    return NULL;
+}
+static void mutex_counts(void) {
+    MutexInit init=GET(MutexInit,"cmo1RIYva9o#libkernel");
+    HandleOp destroy=GET(HandleOp,"2Of0f+3mhhE#libkernel");
+    void *mutexes_[COUNT_THREADS]={0};
+    size_t before[4], after[4];
+    runtime_mutex_flush_counts();
+    runtime_mutex_counts(before);
+    pthread_t threads[COUNT_THREADS];
+    for (int i=0;i<COUNT_THREADS;++i) {
+        assert(init(&mutexes_[i],NULL,"count-test")==0);
+        assert(!pthread_create(&threads[i],NULL,count_locks,&mutexes_[i]));
+    }
+    for (int i=0;i<COUNT_THREADS;++i) assert(!pthread_join(threads[i],NULL));
+    runtime_mutex_counts(after);
+    assert(after[0]-before[0]==COUNT_THREADS*COUNT_PAIRS);
+    assert(after[1]-before[1]==COUNT_THREADS*COUNT_PAIRS);
+    for (int i=0;i<COUNT_THREADS;++i) assert(destroy(&mutexes_[i])==0);
+}
 static void posix_mutexes(void) {
     AttrInit init=GET(AttrInit,"dQHWEsJtoE4#libkernel");
     AttrType type=GET(AttrType,"mDmgMOGVUqg#libkernel");
@@ -382,7 +408,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); mutex_counts(); direct_memory(); memory_primitives();
     rw_lifecycle(); rw_concurrency(); rw_timeouts(); pthread_once_calls();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;

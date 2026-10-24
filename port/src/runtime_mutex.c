@@ -10,7 +10,29 @@
 typedef struct { int type; } GuestAttr;
 /* owner/depth: who holds it, for the freeze report (written only while holding the mutex). */
 typedef struct { pthread_mutex_t native; void *owner; unsigned depth; char name[32]; } GuestMutex;
-static size_t created, locks, unlocks;
+static size_t created;
+/* Lock, unlock, wait and wakeup counts for the exit report. Each thread counts in its own slots and
+ * adds them to the shared totals every COUNT_BATCH events, at guest thread exit and in the report:
+ * one shared counter bumped by every lock moved its cache line between the cores and made an
+ * uncontended lock+unlock about 8x slower with 4 threads locking their own mutexes. The report
+ * misses at most COUNT_BATCH-1 events per kind for each thread still running at exit. */
+enum { COUNT_LOCKS, COUNT_UNLOCKS, COUNT_WAITS, COUNT_WAKEUPS, COUNT_KINDS, COUNT_BATCH = 256 };
+static size_t totals[COUNT_KINDS];
+static _Thread_local size_t local_counts[COUNT_KINDS];
+static void count(int kind) {
+    if (++local_counts[kind] < COUNT_BATCH) return;
+    __atomic_add_fetch(&totals[kind], local_counts[kind], __ATOMIC_RELAXED);
+    local_counts[kind] = 0;
+}
+void runtime_mutex_flush_counts(void) {
+    for (int kind = 0; kind < COUNT_KINDS; ++kind) {
+        if (local_counts[kind]) __atomic_add_fetch(&totals[kind], local_counts[kind], __ATOMIC_RELAXED);
+        local_counts[kind] = 0;
+    }
+}
+void runtime_mutex_counts(size_t out[4]) {
+    for (int kind = 0; kind < COUNT_KINDS; ++kind) out[kind] = __atomic_load_n(&totals[kind], __ATOMIC_RELAXED);
+}
 static int32_t orbis_error(int e) {
     if (!e) return 0;
     unsigned code;
@@ -101,7 +123,7 @@ static int32_t lock_mutex(GuestMutex **mutex, uintptr_t frame) {
         runtime_wait_end();
     }
     e = orbis_error(r);
-    if (!e) { ++locks; took(m); }
+    if (!e) { count(COUNT_LOCKS); took(m); }
     return e;
 }
 static ABI int32_t mutex_lock(GuestMutex **mutex) { return lock_mutex(mutex, RUNTIME_GUEST_FRAME()); }
@@ -109,7 +131,7 @@ static ABI int32_t mutex_trylock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     e = orbis_error(pthread_mutex_trylock(&(*mutex)->native));
-    if (!e) { ++locks; took(*mutex); }
+    if (!e) { count(COUNT_LOCKS); took(*mutex); }
     return e;
 }
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
@@ -120,7 +142,7 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     unsigned depth = m->depth;
     releasing(m);
     int32_t e = orbis_error(pthread_mutex_unlock(&m->native));
-    if (!e) ++unlocks;
+    if (!e) count(COUNT_UNLOCKS);
     else { m->owner = owner; m->depth = depth; } /* not unlocked: still held as before */
     return e;
 }
@@ -149,13 +171,13 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     runtime_wait_begin("mutex (timed)", m, m->name, (const void *const *)&m->owner, frame);
     e = timed_error(pthread_mutex_timedlock(&m->native, &end));
     runtime_wait_end();
-    if (!e) { ++locks; took(m); }
+    if (!e) { count(COUNT_LOCKS); took(m); }
     return e;
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
  * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
 typedef struct { pthread_cond_t native; char name[32]; } GuestCond;
-static size_t conds, waits, wakeups;
+static size_t conds;
 static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     (void)attr;
     if (!out) return orbis_error(EINVAL);
@@ -201,7 +223,7 @@ static int32_t cond_wait_at(GuestCond **cond, GuestMutex **mutex, uintptr_t fram
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
-    ++waits;
+    count(COUNT_WAITS);
     return orbis_error(wait_cond(*cond, *mutex, NULL, frame));
 }
 static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) { return cond_wait_at(cond, mutex, RUNTIME_GUEST_FRAME()); }
@@ -209,7 +231,7 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
-    ++waits;
+    count(COUNT_WAITS);
     return timed_error(wait_cond(*cond, *mutex, end, frame));
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
@@ -221,12 +243,12 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(pthread_cond_signal(&(*cond)->native));
+    count(COUNT_WAKEUPS); return orbis_error(pthread_cond_signal(&(*cond)->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
+    count(COUNT_WAKEUPS); return orbis_error(pthread_cond_broadcast(&(*cond)->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
@@ -296,7 +318,10 @@ uintptr_t runtime_mutex_resolve(const char *name) {
     return 0;
 }
 void runtime_mutex_report(void) {
-    printf("Runtime: mutexes created=%zu, locks=%zu, unlocks=%zu\n", created, locks, unlocks);
-    printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", conds, waits, wakeups);
+    size_t n[COUNT_KINDS];
+    runtime_mutex_flush_counts();
+    runtime_mutex_counts(n);
+    printf("Runtime: mutexes created=%zu, locks=%zu, unlocks=%zu\n", created, n[COUNT_LOCKS], n[COUNT_UNLOCKS]);
+    printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", conds, n[COUNT_WAITS], n[COUNT_WAKEUPS]);
 }
 
