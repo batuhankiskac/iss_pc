@@ -536,6 +536,7 @@ static void *host_start(void *p) {
     apply_prio(t->os_tid,t->attr.prio); /* the priority is ours now; the creator had no host tid */
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
+    runtime_mutex_flush_counts();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
